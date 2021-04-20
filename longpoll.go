@@ -78,8 +78,6 @@ func (m *LongpollManager) Shutdown() {
 	close(m.stopSignal)
 }
 
-type ParamParseHandler func(w http.ResponseWriter, r *http.Request)
-
 // Options for LongpollManager that get sent to StartLongpoll(options)
 type Options struct {
 	// Whether or not to print logs about longpolling
@@ -119,33 +117,58 @@ type Options struct {
 
 	//
 	//
-	Categories func(w http.ResponseWriter, r *http.Request) []string
+	ParseCategories func(r *http.Request) ([]string, error)
 
 	//
 	//
-	SinceTime func(w http.ResponseWriter, r *http.Request) int64
+	ParseTimeout func(r *http.Request) (int, error)
 
 	//
 	//
-	Timeout func(w http.ResponseWriter, r *http.Request) int
-
-	//
-	//
-	ResponseWriter func(w http.ResponseWriter, code int, errMsg string, events []lpEvent)
+	ResponseWriteHandler func(w http.ResponseWriter, code int, errMsg string, events []lpEvent)
 }
 
-func defaultOptionCategories(w http.ResponseWriter, r *http.Request) []string {
+func defaultParseCategories(r *http.Request) ([]string, error) {
 	category := r.URL.Query().Get("category")
-	//if len(category) == 0 || len(category) > 1024 {
-	//	if loggingEnabled {
-	//		log.Printf("Error: Invalid subscription category, must be 1-1024 characters long.\n")
-	//	}
-	//	io.WriteString(w, "{\"error\": \"Invalid subscription category, must be 1-1024 characters long.\"}")
-	//	return
-	//}
+	if len(category) == 0 || len(category) > 1024 {
+
+		return nil, errors.New("Invalid subscription category, must be 1-1024 characters long.")
+		//if loggingEnabled {
+		//	log.Printf("Error: Invalid subscription category, must be 1-1024 characters long.\n")
+		//}
+		//io.WriteString(w, "{\"error\": \"Invalid subscription category, must be 1-1024 characters long.\"}")
+		//return
+	}
 
 	topics := strings.Split(category, ",")
-	return topics
+	return topics, nil
+}
+
+func defaultParseTimeout(r *http.Request) (int, error) {
+	return strconv.Atoi(r.URL.Query().Get("timeout"))
+}
+
+func defaultResponseWriter(w http.ResponseWriter, code int, errMsg string, events []lpEvent)  {
+	resp := response{code, errMsg, events, timeToEpochMilliseconds(time.Now())}
+
+	if jsonData, err := json.Marshal(resp); err == nil {
+		io.WriteString(w, string(jsonData))
+	} else {
+		io.WriteString(w, "{\"errcode\":\"-1\",\"errmsg\": \"json marshaller failed\"}")
+	}
+}
+
+func DefaultOptions() Options {
+	return Options{
+		LoggingEnabled:                 false,
+		MaxLongpollTimeoutSeconds:      120,
+		MaxEventBufferSize:             250,
+		EventTimeToLiveSeconds:         FOREVER,
+		DeleteEventAfterFirstRetrieval: false,
+		ParseCategories:                defaultParseCategories,
+		ParseTimeout:                   defaultParseTimeout,
+		ResponseWriteHandler:           defaultResponseWriter,
+	}
 }
 
 // StartLongpoll creates a LongpollManager, starts the internal pub-sub goroutine
@@ -214,7 +237,7 @@ func StartLongpoll(opts Options) (*LongpollManager, error) {
 		&subManager,
 		events,
 		quit,
-		getLongPollSubscriptionHandler(opts.MaxLongpollTimeoutSeconds, clientRequestChan, clientTimeoutChan, opts.LoggingEnabled),
+		getLongPollSubscriptionHandler(opts, clientRequestChan, clientTimeoutChan),
 	}
 	return &LongpollManager, nil
 }
@@ -248,10 +271,13 @@ func newclientSubscription(subscriptionCategory []string, lastEventTime time.Tim
 }
 
 // get web handler that has closure around sub chanel and clientTimeout channnel
-func getLongPollSubscriptionHandler(maxTimeoutSeconds int, subscriptionRequests chan clientSubscription,
-	clientTimeouts chan<- clientCategoryPair, loggingEnabled bool) func(w http.ResponseWriter, r *http.Request) {
+func getLongPollSubscriptionHandler(opts Options, subscriptionRequests chan clientSubscription,
+	clientTimeouts chan<- clientCategoryPair) func(w http.ResponseWriter, r *http.Request) {
+
+	maxTimeoutSeconds := opts.MaxLongpollTimeoutSeconds
+	loggingEnabled := opts.LoggingEnabled
+
 	return func(w http.ResponseWriter, r *http.Request) {
-		timeout, err := strconv.Atoi(r.URL.Query().Get("timeout"))
 		if loggingEnabled {
 			log.Println("Handling HTTP request at ", r.URL)
 		}
@@ -262,20 +288,14 @@ func getLongPollSubscriptionHandler(maxTimeoutSeconds int, subscriptionRequests 
 		w.Header().Set("Cache-Control", "no-cache, no-store, must-revalidate") // HTTP 1.1.
 		w.Header().Set("Pragma", "no-cache")                                   // HTTP 1.0.
 		w.Header().Set("Expires", "0")                                         // Proxies.
+
+		timeout, err := opts.ParseTimeout(r)
 		if err != nil || timeout > maxTimeoutSeconds || timeout < 1 {
 			if loggingEnabled {
 				log.Printf("Error: Invalid timeout param.  Must be 1-%d. Got: %q.\n",
 					maxTimeoutSeconds, r.URL.Query().Get("timeout"))
 			}
-			io.WriteString(w, fmt.Sprintf("{\"error\": \"Invalid timeout arg.  Must be 1-%d.\"}", maxTimeoutSeconds))
-			return
-		}
-		category := r.URL.Query().Get("category")
-		if len(category) == 0 || len(category) > 1024 {
-			if loggingEnabled {
-				log.Printf("Error: Invalid subscription category, must be 1-1024 characters long.\n")
-			}
-			io.WriteString(w, "{\"error\": \"Invalid subscription category, must be 1-1024 characters long.\"}")
+			opts.ResponseWriteHandler(w, -1, fmt.Sprintf("Invalid timeout arg.  Must be 1-%d.", maxTimeoutSeconds), nil)
 			return
 		}
 		// Default to only looking for current events
@@ -292,18 +312,24 @@ func getLongPollSubscriptionHandler(maxTimeoutSeconds int, subscriptionRequests 
 					log.Printf("Error parsing since_time arg. Parm Value: %s, Error: %s.\n",
 						lastEventTimeParam, parseError)
 				}
-				io.WriteString(w, "{\"error\": \"Invalid since_time arg.\"}")
+				opts.ResponseWriteHandler(w, -1, "Invalid since_time arg", nil)
 				return
 			}
 		}
 
-		topics := defaultOptionCategories(w, r)
+		topics, err := opts.ParseCategories(r)
+		if err != nil {
+			if loggingEnabled {
+				log.Printf("Error: %s\n", err.Error())
+			}
+			opts.ResponseWriteHandler(w, -1, err.Error(), nil)
+		}
 		subscription, err := newclientSubscription(topics, lastEventTime)
 		if err != nil {
 			if loggingEnabled {
 				log.Printf("Error creating new Subscription: %s.\n", err)
 			}
-			io.WriteString(w, "{\"error\": \"Error creating new Subscription.\"}")
+			opts.ResponseWriteHandler(w, -1, "Error creating new Subscription.", nil)
 			return
 		}
 		subscriptionRequests <- *subscription
@@ -318,20 +344,13 @@ func getLongPollSubscriptionHandler(maxTimeoutSeconds int, subscriptionRequests 
 			// channel.
 			clientTimeouts <- subscription.clientCategoryPair
 			timeoutResp := makeTimeoutResponse(time.Now())
-			if jsonData, err := json.Marshal(timeoutResp); err == nil {
-				io.WriteString(w, string(jsonData))
-			} else {
-				io.WriteString(w, "{\"error\": \"json marshaller failed\"}")
-			}
+			opts.ResponseWriteHandler(w, -2, timeoutResp.TimeoutMessage, nil)
+
 		case events := <-subscription.Events:
 			// Consume event.  Subscription manager will automatically discard
 			// this client's channel upon sending event
 			// NOTE: event is actually []Event
-			if jsonData, err := json.Marshal(eventResponse{&events}); err == nil {
-				io.WriteString(w, string(jsonData))
-			} else {
-				io.WriteString(w, "{\"error\": \"json marshaller failed\"}")
-			}
+			opts.ResponseWriteHandler(w, 0, "", events)
 		case <-disconnectNotify:
 			// Client connection closed before any events occurred and before
 			// the timeout was exceeded.  Tell manager to forget about this
@@ -725,4 +744,12 @@ func (sm *subscriptionManager) priorityQueueUpdateDeletedBuffer(expiringBuf *exp
 	heap.Remove(&sm.bufferPriorityQueue, expiringBuf.index)
 	expiringBuf.eventBufferPtr = nil // remove reference to eventBuffer
 	return nil
+}
+
+//
+type response struct {
+	ErrCode int `json:"errcode"`
+	ErrMsg string `json:"errmsg"`
+	List []lpEvent `json:"list"`
+	Timestamp int64 `json:"timestamp"`
 }
