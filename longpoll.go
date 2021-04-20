@@ -10,6 +10,7 @@ import (
 	"log"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/nu7hatch/gouuid"
@@ -77,6 +78,8 @@ func (m *LongpollManager) Shutdown() {
 	close(m.stopSignal)
 }
 
+type ParamParseHandler func(w http.ResponseWriter, r *http.Request)
+
 // Options for LongpollManager that get sent to StartLongpoll(options)
 type Options struct {
 	// Whether or not to print logs about longpolling
@@ -113,6 +116,36 @@ type Options struct {
 	// event occurs.  This event gets sent to all listening clients and then
 	// the event skips being placed in a buffer and is gone forever.
 	DeleteEventAfterFirstRetrieval bool
+
+	//
+	//
+	Categories func(w http.ResponseWriter, r *http.Request) []string
+
+	//
+	//
+	SinceTime func(w http.ResponseWriter, r *http.Request) int64
+
+	//
+	//
+	Timeout func(w http.ResponseWriter, r *http.Request) int
+
+	//
+	//
+	ResponseWriter func(w http.ResponseWriter, code int, errMsg string, events []lpEvent)
+}
+
+func defaultOptionCategories(w http.ResponseWriter, r *http.Request) []string {
+	category := r.URL.Query().Get("category")
+	//if len(category) == 0 || len(category) > 1024 {
+	//	if loggingEnabled {
+	//		log.Printf("Error: Invalid subscription category, must be 1-1024 characters long.\n")
+	//	}
+	//	io.WriteString(w, "{\"error\": \"Invalid subscription category, must be 1-1024 characters long.\"}")
+	//	return
+	//}
+
+	topics := strings.Split(category, ",")
+	return topics
 }
 
 // StartLongpoll creates a LongpollManager, starts the internal pub-sub goroutine
@@ -196,13 +229,18 @@ type clientSubscription struct {
 	Events chan []lpEvent
 }
 
-func newclientSubscription(subscriptionCategory string, lastEventTime time.Time) (*clientSubscription, error) {
+func newclientSubscription(subscriptionCategory []string, lastEventTime time.Time) (*clientSubscription, error) {
 	u, err := uuid.NewV4()
 	if err != nil {
 		return nil, err
 	}
+
+	topics := make(map[string]bool)
+	for _, v := range subscriptionCategory {
+		topics[v] = true
+	}
 	subscription := clientSubscription{
-		clientCategoryPair{*u, subscriptionCategory},
+		clientCategoryPair{*u, "", topics, ""},
 		lastEventTime,
 		make(chan []lpEvent, 1),
 	}
@@ -258,7 +296,9 @@ func getLongPollSubscriptionHandler(maxTimeoutSeconds int, subscriptionRequests 
 				return
 			}
 		}
-		subscription, err := newclientSubscription(category, lastEventTime)
+
+		topics := defaultOptionCategories(w, r)
+		subscription, err := newclientSubscription(topics, lastEventTime)
 		if err != nil {
 			if loggingEnabled {
 				log.Printf("Error creating new Subscription: %s.\n", err)
@@ -313,8 +353,11 @@ func makeTimeoutResponse(t time.Time) *timeoutResponse {
 }
 
 type clientCategoryPair struct {
-	ClientUUID           uuid.UUID
-	SubscriptionCategory string
+	ClientUUID uuid.UUID
+	// 故意先改成别名，防止漏改引用这个变量的地方
+	SubscriptionCategor string
+	Topics              map[string]bool
+	topic               string
 }
 
 type subscriptionManager struct {
@@ -364,7 +407,10 @@ func (sm *subscriptionManager) run() error {
 			sm.handleNewClient(&newClient)
 			sm.seeIfTimeToPurgeStaleCategories()
 		case disconnected := <-sm.ClientTimeouts:
-			sm.handleClientDisconnect(&disconnected)
+			for topic := range disconnected.Topics {
+				disconnected.topic = topic
+				sm.handleClientDisconnect(&disconnected)
+			}
 			sm.seeIfTimeToPurgeStaleCategories()
 		case event := <-sm.Events:
 			sm.handleNewEvent(&event)
@@ -392,78 +438,89 @@ func (sm *subscriptionManager) seeIfTimeToPurgeStaleCategories() error {
 
 func (sm *subscriptionManager) handleNewClient(newClient *clientSubscription) error {
 	var funcErr error
+	var eventsTotal []lpEvent
 	// before storing client sub request, see if we already have data in
 	// the corresponding event buffer that we can use to fufil request
 	// without storing it
 	doQueueRequest := true
-	if expiringBuf, found := sm.SubEventBuffer[newClient.SubscriptionCategory]; found {
-		// First clean up anything that expired
-		sm.checkExpiredEvents(expiringBuf)
-		// We have a buffer for this sub category, check for buffered events
-		if events, err := expiringBuf.eventBufferPtr.GetEventsSince(newClient.LastEventTime,
-			sm.DeleteEventAfterFirstRetrieval); err == nil && len(events) > 0 {
-			doQueueRequest = false
-			if sm.LoggingEnabled {
-				log.Printf("SubscriptionManager: Skip adding client, sending %d events. (Category: %q Client: %s)\n",
-					len(events), newClient.SubscriptionCategory, newClient.ClientUUID.String())
+
+	for topic := range newClient.Topics {
+		if expiringBuf, found := sm.SubEventBuffer[topic]; found {
+			// First clean up anything that expired
+			sm.checkExpiredEvents(expiringBuf)
+			// We have a buffer for this sub category, check for buffered events
+
+			if events, err := expiringBuf.eventBufferPtr.GetEventsSince(newClient.LastEventTime,
+				sm.DeleteEventAfterFirstRetrieval); err == nil && len(events) > 0 {
+				doQueueRequest = false
+				if sm.LoggingEnabled {
+					log.Printf("SubscriptionManager: Skip adding client, sending %d events. (Category: %q Client: %s)\n",
+						len(events), topic, newClient.ClientUUID.String())
+				}
+				// Send client buffered events.  Client will immediately consume
+				// and end long poll request, so no need to have manager store
+				eventsTotal = append(eventsTotal, events...)
+			} else if err != nil {
+				funcErr = fmt.Errorf("Error getting events from event buffer: %s.\n", err)
+				if sm.LoggingEnabled {
+					log.Printf("Error getting events from event buffer: %s.\n", err)
+				}
 			}
-			// Send client buffered events.  Client will immediately consume
-			// and end long poll request, so no need to have manager store
-			newClient.Events <- events
-		} else if err != nil {
-			funcErr = fmt.Errorf("Error getting events from event buffer: %s.\n", err)
-			if sm.LoggingEnabled {
-				log.Printf("Error getting events from event buffer: %s.\n", err)
+			// Buffer Could have been emptied due to the  DeleteEventAfterFirstRetrieval
+			// or EventTimeToLiveSeconds options.
+			sm.deleteBufferIfEmpty(expiringBuf, topic)
+			// NOTE: expiringBuf may now be invalidated (if it was empty/deleted),
+			// don't use ref anymore.
+		}
+
+		if doQueueRequest {
+			// Couldn't find any immediate events, store for future:
+			categoryClients, found := sm.ClientSubChannels[topic]
+			if !found {
+				// first request for this sub category, add client chan map entry
+				categoryClients = make(map[uuid.UUID]chan<- []lpEvent)
+				sm.ClientSubChannels[topic] = categoryClients
 			}
+			if sm.LoggingEnabled {
+				log.Printf("SubscriptionManager: Adding Client (Category: %q Client: %s)\n",
+					topic, newClient.ClientUUID.String())
+			}
+			categoryClients[newClient.ClientUUID] = newClient.Events
 		}
-		// Buffer Could have been emptied due to the  DeleteEventAfterFirstRetrieval
-		// or EventTimeToLiveSeconds options.
-		sm.deleteBufferIfEmpty(expiringBuf, newClient.SubscriptionCategory)
-		// NOTE: expiringBuf may now be invalidated (if it was empty/deleted),
-		// don't use ref anymore.
 	}
-	if doQueueRequest {
-		// Couldn't find any immediate events, store for future:
-		categoryClients, found := sm.ClientSubChannels[newClient.SubscriptionCategory]
-		if !found {
-			// first request for this sub category, add client chan map entry
-			categoryClients = make(map[uuid.UUID]chan<- []lpEvent)
-			sm.ClientSubChannels[newClient.SubscriptionCategory] = categoryClients
-		}
-		if sm.LoggingEnabled {
-			log.Printf("SubscriptionManager: Adding Client (Category: %q Client: %s)\n",
-				newClient.SubscriptionCategory, newClient.ClientUUID.String())
-		}
-		categoryClients[newClient.ClientUUID] = newClient.Events
+
+	if len(eventsTotal) > 0 {
+		newClient.Events <- eventsTotal
 	}
+
 	return funcErr
 }
 
 func (sm *subscriptionManager) handleClientDisconnect(disconnected *clientCategoryPair) error {
 	var funcErr error
-	if subCategoryClients, found := sm.ClientSubChannels[disconnected.SubscriptionCategory]; found {
+	if subCategoryClients, found := sm.ClientSubChannels[disconnected.topic]; found {
 		// NOTE:  The delete function doesn't return anything, and will do nothing if the
 		// specified key doesn't exist.
 		delete(subCategoryClients, disconnected.ClientUUID)
 		if sm.LoggingEnabled {
 			log.Printf("SubscriptionManager: Removing Client (Category: %q Client: %s)\n",
-				disconnected.SubscriptionCategory, disconnected.ClientUUID.String())
+				disconnected.topic, disconnected.ClientUUID.String())
 		}
 		// Remove the client sub map entry for this category if there are
 		// zero clients.  This keeps the ClientSubChannels map lean in
 		// the event that there are many categories over time and we
 		// would otherwise keep a bunch of empty sub maps
 		if len(subCategoryClients) == 0 {
-			delete(sm.ClientSubChannels, disconnected.SubscriptionCategory)
+			delete(sm.ClientSubChannels, disconnected.topic)
 		}
 	} else {
 		// Sub category entry not found.  Weird.  Log this!
 		if sm.LoggingEnabled {
 			log.Printf("Warning: client disconnect for non-existing subscription category: %q\n",
-				disconnected.SubscriptionCategory)
+				disconnected.topic)
 		}
 		funcErr = fmt.Errorf("Client disconnect for non-existing subscription category: %q\n",
-			disconnected.SubscriptionCategory)
+			disconnected.topic)
 	}
 	return funcErr
 }
