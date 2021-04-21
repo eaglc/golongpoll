@@ -52,6 +52,7 @@ type LongpollManager struct {
 	eventsIn            chan<- lpEvent
 	stopSignal          chan<- bool
 	SubscriptionHandler func(w http.ResponseWriter, r *http.Request)
+	Opts                Options
 }
 
 // Publish an event for a given subscription category.  This event can have any
@@ -148,7 +149,7 @@ func defaultParseTimeout(r *http.Request) (int, error) {
 	return strconv.Atoi(r.URL.Query().Get("timeout"))
 }
 
-func defaultResponseWriter(w http.ResponseWriter, code int, errMsg string, events []lpEvent)  {
+func defaultResponseWriter(w http.ResponseWriter, code int, errMsg string, events []lpEvent) {
 	resp := response{code, errMsg, events, timeToEpochMilliseconds(time.Now())}
 
 	if jsonData, err := json.Marshal(resp); err == nil {
@@ -238,6 +239,7 @@ func StartLongpoll(opts Options) (*LongpollManager, error) {
 		events,
 		quit,
 		getLongPollSubscriptionHandler(opts, clientRequestChan, clientTimeoutChan),
+		opts,
 	}
 	return &LongpollManager, nil
 }
@@ -748,8 +750,8 @@ func (sm *subscriptionManager) priorityQueueUpdateDeletedBuffer(expiringBuf *exp
 
 //
 type response struct {
-	ErrCode int `json:"errcode"`
-	ErrMsg string `json:"errmsg"`
-	List []lpEvent `json:"list"`
-	Timestamp int64 `json:"timestamp"`
+	ErrCode   int       `json:"errcode"`
+	ErrMsg    string    `json:"errmsg"`
+	List      []lpEvent `json:"list"`
+	Timestamp int64     `json:"timestamp"`
 }
