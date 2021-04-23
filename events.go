@@ -7,12 +7,12 @@ import (
 	"time"
 )
 
-// lpEvent is a longpoll event.  This type has a Timestamp as milliseconds since
+// LpEvent is a longpoll event.  This type has a Timestamp as milliseconds since
 // epoch (UTC), a string category, and an arbitrary Data payload.
 // The category is the subscription category/topic that clients can listen for
 // via longpolling.  The Data payload can be anything that is JSON serializable
 // via the encoding/json library's json.Marshal function.
-type lpEvent struct {
+type LpEvent struct {
 	// Timestamp is milliseconds since epoch to match javascrits Date.getTime()
 	Timestamp int64  `json:"timestamp"`
 	Category  string `json:"category"`
@@ -22,7 +22,7 @@ type lpEvent struct {
 
 // eventResponse is the json response that carries longpoll events.
 type eventResponse struct {
-	Events *[]lpEvent `json:"events"`
+	Events *[]LpEvent `json:"events"`
 }
 
 // eventBuffer is a buffer of Events that adds new events to the front/root and
@@ -40,7 +40,7 @@ type eventBuffer struct {
 	*list.List
 	MaxBufferSize int
 	// keeping track of this allows for more efficient event TTL expiration purges:
-	// time in milliseconds since epoch since thats what lpEvent types use
+	// time in milliseconds since epoch since thats what LpEvent types use
 	// for Timestamps
 	oldestEventTime int64
 }
@@ -48,7 +48,7 @@ type eventBuffer struct {
 // QueueEvent adds a new longpoll Event to the front of our buffer and removes
 // the oldest event from the back of the buffer if we're already at maximum
 // capacity.
-func (eb *eventBuffer) QueueEvent(event *lpEvent) error {
+func (eb *eventBuffer) QueueEvent(event *LpEvent) error {
 	if event == nil {
 		return errors.New("event was nil")
 	}
@@ -64,7 +64,7 @@ func (eb *eventBuffer) QueueEvent(event *lpEvent) error {
 	// Update oldestEventTime with the time of our least recent event (at back)
 	// keeping track of this allows for more efficient event TTL expiration purges
 	if lastElement := eb.List.Back(); lastElement != nil {
-		lastEvent, ok := lastElement.Value.(*lpEvent)
+		lastEvent, ok := lastElement.Value.(*LpEvent)
 		if !ok {
 			return fmt.Errorf("Found non-event type in event buffer.")
 		}
@@ -79,8 +79,8 @@ func (eb *eventBuffer) QueueEvent(event *lpEvent) error {
 // Optionally removes returned events from the eventBuffer if told to do so by
 // deleteFetchedEvents argument.
 func (eb *eventBuffer) GetEventsSince(since time.Time,
-	deleteFetchedEvents bool) ([]lpEvent, error) {
-	events := make([]lpEvent, 0)
+	deleteFetchedEvents bool) ([]LpEvent, error) {
+	events := make([]LpEvent, 0)
 	// NOTE: events are bufferd with the most recent event at the front.
 	// So we want to start our search at the front of the buffer and stop
 	// searching once we've reached events that are older than the 'since'
@@ -93,7 +93,7 @@ func (eb *eventBuffer) GetEventsSince(since time.Time,
 	var lastGoodItem *list.Element
 	// Search forward until we reach events that are too old
 	for element := eb.List.Front(); element != nil; element = element.Next() {
-		event, ok := element.Value.(*lpEvent)
+		event, ok := element.Value.(*LpEvent)
 		if !ok {
 			return events, fmt.Errorf("Found non-event type in event buffer.")
 		}
@@ -112,14 +112,14 @@ func (eb *eventBuffer) GetEventsSince(since time.Time,
 		// Tracked outside of loop conditional to allow delete while iterating:
 		var prev *list.Element
 		for element := lastGoodItem; element != nil; element = prev {
-			event, ok := element.Value.(*lpEvent)
+			event, ok := element.Value.(*LpEvent)
 			if !ok {
 				return events, fmt.Errorf(
 					"Found non-event type in event buffer.")
 			}
 			// we already know this event is after 'since'
 			events = append(events,
-				lpEvent{event.Timestamp, event.Category, event.Data})
+				LpEvent{event.Timestamp, event.Category, event.Data})
 			// Advance iteration before List.Remove() invalidates element.prev
 			prev = element.Prev()
 			// Now safely remove from list if told to do so:
@@ -144,7 +144,7 @@ func (eb *eventBuffer) DeleteEventsOlderThan(olderThanTimeMs int64) error {
 	// the back, newest up front.
 	var prev *list.Element
 	for element := eb.List.Back(); element != nil; element = prev {
-		event, ok := element.Value.(*lpEvent)
+		event, ok := element.Value.(*LpEvent)
 		if !ok {
 			return fmt.Errorf("Found non-event type in event buffer.")
 		}

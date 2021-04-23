@@ -49,7 +49,7 @@ const (
 // channels, you can simply create multiple LongpollManagers.
 type LongpollManager struct {
 	subManager          *subscriptionManager
-	eventsIn            chan<- lpEvent
+	eventsIn            chan<- LpEvent
 	stopSignal          chan<- bool
 	SubscriptionHandler func(w http.ResponseWriter, r *http.Request)
 	Opts                Options
@@ -66,7 +66,7 @@ func (m *LongpollManager) Publish(category string, data interface{}) error {
 	if len(category) > 1024 {
 		return errors.New("category cannot be longer than 1024")
 	}
-	m.eventsIn <- lpEvent{timeToEpochMilliseconds(time.Now()), category, data}
+	m.eventsIn <- LpEvent{timeToEpochMilliseconds(time.Now()), category, data}
 	return nil
 }
 
@@ -126,7 +126,7 @@ type Options struct {
 
 	//
 	//
-	ResponseWriteHandler func(w http.ResponseWriter, code int, errMsg string, events []lpEvent)
+	ResponseWriteHandler func(w http.ResponseWriter, code int, errMsg string, events []LpEvent)
 }
 
 func defaultParseCategories(r *http.Request) ([]string, error) {
@@ -149,7 +149,7 @@ func defaultParseTimeout(r *http.Request) (int, error) {
 	return strconv.Atoi(r.URL.Query().Get("timeout"))
 }
 
-func defaultResponseWriter(w http.ResponseWriter, code int, errMsg string, events []lpEvent) {
+func defaultResponseWriter(w http.ResponseWriter, code int, errMsg string, events []LpEvent) {
 	resp := response{code, errMsg, events, timeToEpochMilliseconds(time.Now())}
 
 	if jsonData, err := json.Marshal(resp); err == nil {
@@ -203,14 +203,14 @@ func StartLongpoll(opts Options) (*LongpollManager, error) {
 	channelSize := 100
 	clientRequestChan := make(chan clientSubscription, channelSize)
 	clientTimeoutChan := make(chan clientCategoryPair, channelSize)
-	events := make(chan lpEvent, channelSize)
+	events := make(chan LpEvent, channelSize)
 	// never has a send, only a close, so no larger capacity needed:
 	quit := make(chan bool, 1)
 	subManager := subscriptionManager{
 		clientSubscriptions:            clientRequestChan,
 		ClientTimeouts:                 clientTimeoutChan,
 		Events:                         events,
-		ClientSubChannels:              make(map[string]map[uuid.UUID]chan<- []lpEvent),
+		ClientSubChannels:              make(map[string]map[uuid.UUID]chan<- []LpEvent),
 		SubEventBuffer:                 make(map[string]*expiringBuffer),
 		Quit:                           quit,
 		LoggingEnabled:                 opts.LoggingEnabled,
@@ -251,7 +251,7 @@ type clientSubscription struct {
 	// we channel arrays of events since we need to send everything a client
 	// cares about in a single channel send.  This makes channel receives a
 	// one shot deal.
-	Events chan []lpEvent
+	Events chan []LpEvent
 }
 
 func newclientSubscription(subscriptionCategory []string, lastEventTime time.Time) (*clientSubscription, error) {
@@ -267,7 +267,7 @@ func newclientSubscription(subscriptionCategory []string, lastEventTime time.Tim
 	subscription := clientSubscription{
 		clientCategoryPair{*u, "", topics, ""},
 		lastEventTime,
-		make(chan []lpEvent, 1),
+		make(chan []LpEvent, 1),
 	}
 	return &subscription, nil
 }
@@ -384,10 +384,10 @@ type clientCategoryPair struct {
 type subscriptionManager struct {
 	clientSubscriptions chan clientSubscription
 	ClientTimeouts      <-chan clientCategoryPair
-	Events              <-chan lpEvent
+	Events              <-chan LpEvent
 	// Contains all client sub channels grouped first by sub id then by
 	// client uuid
-	ClientSubChannels map[string]map[uuid.UUID]chan<- []lpEvent
+	ClientSubChannels map[string]map[uuid.UUID]chan<- []LpEvent
 	SubEventBuffer    map[string]*expiringBuffer
 	// channel to inform manager to stop running
 	Quit           <-chan bool
@@ -459,7 +459,7 @@ func (sm *subscriptionManager) seeIfTimeToPurgeStaleCategories() error {
 
 func (sm *subscriptionManager) handleNewClient(newClient *clientSubscription) error {
 	var funcErr error
-	var eventsTotal []lpEvent
+	var eventsTotal []LpEvent
 	// before storing client sub request, see if we already have data in
 	// the corresponding event buffer that we can use to fufil request
 	// without storing it
@@ -499,7 +499,7 @@ func (sm *subscriptionManager) handleNewClient(newClient *clientSubscription) er
 			categoryClients, found := sm.ClientSubChannels[topic]
 			if !found {
 				// first request for this sub category, add client chan map entry
-				categoryClients = make(map[uuid.UUID]chan<- []lpEvent)
+				categoryClients = make(map[uuid.UUID]chan<- []LpEvent)
 				sm.ClientSubChannels[topic] = categoryClients
 			}
 			if sm.LoggingEnabled {
@@ -546,7 +546,7 @@ func (sm *subscriptionManager) handleClientDisconnect(disconnected *clientCatego
 	return funcErr
 }
 
-func (sm *subscriptionManager) handleNewEvent(newEvent *lpEvent) error {
+func (sm *subscriptionManager) handleNewEvent(newEvent *LpEvent) error {
 	var funcErr error
 	doBufferEvents := true
 	// Send event to any listening client's channels
@@ -568,7 +568,7 @@ func (sm *subscriptionManager) handleNewEvent(newEvent *lpEvent) error {
 			if sm.LoggingEnabled {
 				log.Printf("SubscriptionManager: sending event to client: %s\n", clientUUID.String())
 			}
-			clientChan <- []lpEvent{*newEvent}
+			clientChan <- []LpEvent{*newEvent}
 		}
 		// Remove all client subscriptions since we just sent all the
 		// clients an event.  In longpolling, subscriptions only last
@@ -712,11 +712,11 @@ func (sm *subscriptionManager) priorityQueueUpdateBufferCreated(expiringBuf *exp
 	return nil
 }
 
-// Wraps updates to SubscriptionManager.bufferPriorityQueue when a new lpEvent
+// Wraps updates to SubscriptionManager.bufferPriorityQueue when a new LpEvent
 // is added to an eventBuffer.  In the event that we don't expire events
 // (TTL == FOREVER), we don't bother paying the price of keeping the priority
 // queue.
-func (sm *subscriptionManager) priorityQueueUpdateNewEvent(expiringBuf *expiringBuffer, newEvent *lpEvent) error {
+func (sm *subscriptionManager) priorityQueueUpdateNewEvent(expiringBuf *expiringBuffer, newEvent *LpEvent) error {
 	if sm.EventTimeToLiveSeconds == FOREVER {
 		// don't bother keeping track
 		return nil
@@ -752,6 +752,6 @@ func (sm *subscriptionManager) priorityQueueUpdateDeletedBuffer(expiringBuf *exp
 type response struct {
 	ErrCode   int       `json:"errcode"`
 	ErrMsg    string    `json:"errmsg"`
-	List      []lpEvent `json:"list"`
+	List      []LpEvent `json:"list"`
 	Timestamp int64     `json:"timestamp"`
 }
